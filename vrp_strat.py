@@ -127,8 +127,7 @@ class VRP:
             self.expiry_date_list = None
             self.past_expiry_list = []
             self.exit_time = None
-            self.entry_trades = pd.DataFrame()
-            self.exit_trades = pd.DataFrame()
+            self.trades = pd.DataFrame(columns=['Date', 'Portfolio'])
             self.reldf = None
         except Exception as e:
             print(f"ERROR IN INITIALIZING VRP CLASS: \n\t{str(e)}\n")
@@ -158,6 +157,46 @@ class VRP:
         return None
     
 
+    def mtm(self,vix,  c_bid, p_bid, strike, lots, size):
+        call_range = strike + c_bid
+        put_range = strike - p_bid
+        call_loss = 0
+        put_loss = 0
+        if vix >= call_range:
+            call_loss = (vix - call_range) * lots * size
+        elif put_range < vix < call_range:
+            pass
+        else:
+            put_loss = (put_range - vix) * lots * size
+        _mtm = call_loss + put_loss
+        return _mtm
+    
+
+    def calculateDelta(self, c_delta, p_delta, lots, size):
+        opt_delta = p_delta - c_delta
+        net_delta = opt_delta * lots * size
+        return net_delta
+    
+
+    def hedge(self, vix, c_delta, p_delta, lots, size):
+        net_delta = self.calculateDelta(c_delta, p_delta, lots, size)
+        if net_delta == 0:
+            pass    # DO NOTHING
+        elif net_delta > 0:
+            sell_vix = net_delta * vix
+            self.portfolio += sell_vix
+        else:
+            buy_vix = (-1) * net_delta * vix
+            self.portfolio -= buy_vix
+        
+        return None
+    
+
+    def logTrade(self, comment=''):
+        self.trades.loc[len(self.trades)] = [self.entry_time, self.portfolio, comment]
+        return None
+
+
     def main(self) -> None:
         for idx, order_book in enumerate(getOrderBook()):
             self.entry_time = pd.Timestamp(order_book["Date"].unique()[0])
@@ -166,38 +205,68 @@ class VRP:
             self.expiry_date_list = sorted(order_book["Expiry_Date"].unique())
             self.expiry_date = self.get3MonthExpiry()
             self.reldf = order_book[order_book["Expiry_Date"] == self.expiry_date]
+            self.reldf = self.reldf.reset_index().drop(columns='index')
+            current_vix = self.reldf.at[0, "VIX_Close"]
 
             min_strike_dist = self.reldf['Strike_Dist'].argmin()
 
+            strike = self.reldf.at[min_strike_dist, 'Strike']
+            c_bid = self.reldf.at[min_strike_dist, 'C_Bid']
+            c_ask = self.reldf.at[min_strike_dist, 'C_Ask']
+            p_bid = self.reldf.at[min_strike_dist, 'P_Bid']
+            p_ask = self.reldf.at[min_strike_dist, 'P_Ask']
+            c_delta = self.reldf.at[min_strike_dist, 'C_Delta']
+            p_delta = self.reldf.at[min_strike_dist, 'P_Delta']
+
             if self.expiry_date in self.past_expiry_list:
-                # TRAVERSE QUEUE, MARK TO MARKET FOR EACH, SQUARE OFF IF EXPIRY REACHED, IF INVESTED
-                if self.invested:
-                    for conts in self.q.items():
-                        s_expiry_time = self.entry_time
-                        if s_expiry_time < self.entry_time:
-                            # TODO: ADD LOGIC TO DEQUEUE USING ID -> Done
+                # TRAVERSE QUEUE, MARK TO MARKET FOR EACH, SQUARE OFF IF EXPIRY REACHED
+                for conts in self.q.items():
+                    s_expiry_time = conts.expiry_time
+                    if s_expiry_time < self.entry_time:
+                        t = self.q.dequeue(conts.id)
+                    else:
+                        # MARK TO MARKET, HEDGE
+                        _mtm = self.mtm(current_vix, conts.c_bid, conts.p_bid, conts.strike, conts.lots)
+                        self.portfolio -= _mtm
+                        self.hedge(current_vix, c_delta, p_delta, conts.lots, conts.size)
+                        if s_expiry_time == self.entry_time:
+                            # DEQUEUE CONTRACT
                             t = self.q.dequeue(conts.id)
-                            continue    # Continue or Pass?
-                        else:
-                            if s_expiry_time == self.entry_time:
-                                # SQUARE OFF POSITION, MARK TO MARKET, HEDGE, DEQUEUE CONTRACT
-                                pass
-                            else:
-                                # MARK TO MARKET, HEDGE
-                                pass
-                else:
-                    # MARK TO MARKET OTHER TRADES OR SIT IDLE
-                    pass
+                    # TODO: PRINTING LOGIC
+                self.logTrade("No New Trade")
+
             else:
+                for conts in self.q.items():
+                    s_expiry_time = conts.expiry_time
+                    if s_expiry_time < self.entry_time:
+                        # TODO: ADD LOGIC TO DEQUEUE USING ID -> Done
+                        t = self.q.dequeue(conts.id)
+                    else:
+                        # MARK TO MARKET, HEDGE
+                        _mtm = self.mtm(current_vix, conts.c_bid, conts.p_bid, conts.strike, conts.lots)
+                        self.portfolio -= _mtm
+                        self.hedge(current_vix, c_delta, p_delta, conts.lots, conts.size)
+                        if s_expiry_time == self.entry_time:
+                            # DEQUEUE CONTRACT
+                            t = self.q.dequeue(conts.id)
+                    # TODO: PRINTING LOGIC
+
                 self.past_expiry_list.append(self.expiry_date)
                 # LOGIC TO SELL STRADDLE AND HEDGE FOR FIRST TIME EXPIRY DATE
-                strike = self.reldf.at[min_strike_dist, 'Strike']
-                c_bid = self.reldf.at[min_strike_dist, 'C_Bid']
-                c_ask = self.reldf.at[min_strike_dist, 'C_Ask']
-                p_bid = self.reldf.at[min_strike_dist, 'P_Bid']
-                p_ask = self.reldf.at[min_strike_dist, 'P_Ask']
-                c_delta = self.reldf.at[min_strike_dist, 'C_Delta']
-                p_delta = self.reldf.at[min_strike_dist, 'P_Delta']
+                pf_size = int((1 - self.cash_percentage) * self.portfolio)
+                invest_size = int(pf_size / 3)
+                overall_pos = int(invest_size / (c_bid + p_bid))
+                lots = int(overall_pos / 100)
+                _id = idGenerate()
+                new_cont = Straddle(_id, self.entry_time, self.expiry_date, strike, c_bid, c_ask, p_bid, p_ask, lots)
+                self.q.enqueue(new_cont)
+                self.portfolio += lots * 100 * (c_bid + p_bid)
+                
+                # TODO: PRINTING LOGIC
+
+                self.logTrade("New Contracts Sold")
+        
+        # TODO: EXIT LOGIC, AND PRINT
                 
 
 
